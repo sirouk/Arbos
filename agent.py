@@ -1,5 +1,4 @@
 import json
-import logging
 import subprocess
 import sys
 import time
@@ -10,12 +9,62 @@ PROMPT_FILE = Path(__file__).parent / "PROMPT.md"
 WORKING_DIR = Path(__file__).parent
 HISTORY_DIR = WORKING_DIR / "history"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-7s  %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger("agent-loop")
+# ── Colors ───────────────────────────────────────────────────────────────────
+
+if sys.stdout.isatty():
+    GREEN = '\033[0;32m'
+    RED = '\033[0;31m'
+    CYAN = '\033[0;36m'
+    BOLD = '\033[1m'
+    DIM = '\033[2m'
+    NC = '\033[0m'
+else:
+    GREEN = RED = CYAN = BOLD = DIM = NC = ''
+
+_log_fh = None
+
+
+def _file_log(msg: str):
+    if _log_fh:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _log_fh.write(f"{ts}  {msg}\n")
+        _log_fh.flush()
+
+
+def ok(msg: str):
+    print(f"  {GREEN}+{NC} {msg}", flush=True)
+    _file_log(f"+  {msg}")
+
+
+def err(msg: str):
+    print(f"  {RED}x{NC} {msg}", flush=True)
+    _file_log(f"x  {msg}")
+
+
+def header(msg: str):
+    print(f"\n  {BOLD}{msg}{NC}\n", flush=True)
+    _file_log(f"── {msg}")
+
+
+def dim(msg: str):
+    print(f"  {DIM}{msg}{NC}", flush=True)
+    _file_log(f"   {msg}")
+
+
+def info(msg: str):
+    print(f"  {CYAN}·{NC} {msg}", flush=True)
+    _file_log(f"·  {msg}")
+
+
+def banner():
+    print(f"\n{CYAN}{BOLD}", end="")
+    print("      _                    _   ")
+    print("     / \\   __ _  ___ _ __ | |_ ")
+    print("    / _ \\ / _` |/ _ \\ '_ \\| __|")
+    print("   / ___ \\ (_| |  __/ | | | |_ ")
+    print("  /_/   \\_\\__, |\\___|_| |_|\\__|")
+    print("          |___/                ")
+    print(f"{NC}")
 
 
 def fmt_duration(seconds: float) -> str:
@@ -27,11 +76,11 @@ def fmt_duration(seconds: float) -> str:
 
 def load_prompt() -> str:
     if not PROMPT_FILE.exists():
-        log.error("Prompt file not found: %s", PROMPT_FILE)
+        err(f"Prompt file not found: {PROMPT_FILE}")
         sys.exit(1)
     text = PROMPT_FILE.read_text().strip()
     if not text:
-        log.error("Prompt file is empty: %s", PROMPT_FILE)
+        err(f"Prompt file is empty: {PROMPT_FILE}")
         sys.exit(1)
     return text
 
@@ -45,7 +94,6 @@ def make_run_dir() -> Path:
 
 
 def _describe_tool_call(tc: dict) -> str:
-    """Extract a short human-readable description from a stream-json tool_call object."""
     for key, val in tc.items():
         if not isinstance(val, dict):
             continue
@@ -75,7 +123,7 @@ def run_agent(cmd: list[str], phase: str, output_file: Path) -> subprocess.Compl
     if "--stream-partial-output" not in stream_cmd:
         stream_cmd.insert(-1, "--stream-partial-output")
 
-    log.info("Running: %s", " ".join(stream_cmd[:6]) + (" ..." if len(stream_cmd) > 6 else ""))
+    dim(f"running: {' '.join(stream_cmd[:6])}{'…' if len(stream_cmd) > 6 else ''}")
     t0 = time.monotonic()
 
     proc = subprocess.Popen(
@@ -98,10 +146,10 @@ def run_agent(cmd: list[str], phase: str, output_file: Path) -> subprocess.Compl
 
         if etype == "tool_call" and subtype == "started":
             desc = _describe_tool_call(evt.get("tool_call", {}))
-            log.info("[%s] tool call: %s", phase, desc)
+            info(f"{phase} tool call  {desc}")
         elif etype == "tool_call" and subtype == "completed":
             desc = _describe_tool_call(evt.get("tool_call", {}))
-            log.info("[%s] tool done: %s", phase, desc)
+            ok(f"{phase} tool done  {desc}")
         elif etype == "assistant":
             text = ""
             for block in evt.get("message", {}).get("content", []):
@@ -109,24 +157,25 @@ def run_agent(cmd: list[str], phase: str, output_file: Path) -> subprocess.Compl
                     text += block.get("text", "")
             if text.strip():
                 for tline in text.strip().splitlines():
-                    log.info("[%s] %s", phase, tline)
+                    dim(f"[{phase}] {tline}")
         elif etype == "result":
             result_text = evt.get("result", "")
             dur = evt.get("duration_ms", 0)
             usage = evt.get("usage", {})
-            log.info(
-                "[%s] done  duration=%s  tokens_in=%s  tokens_out=%s",
-                phase, fmt_duration(dur / 1000),
-                usage.get("inputTokens", "?"), usage.get("outputTokens", "?"),
+            ok(
+                f"{phase} done  {fmt_duration(dur / 1000)}"
+                f"  in={usage.get('inputTokens', '?')}"
+                f"  out={usage.get('outputTokens', '?')}"
             )
 
     returncode = proc.wait()
     elapsed = time.monotonic() - t0
     output_file.write_text("".join(raw_lines))
-    log.info(
-        "%s finished  rc=%d  duration=%s",
-        phase, returncode, fmt_duration(elapsed),
-    )
+
+    if returncode == 0:
+        ok(f"{phase} finished  rc={returncode}  {fmt_duration(elapsed)}")
+    else:
+        err(f"{phase} finished  rc={returncode}  {fmt_duration(elapsed)}")
 
     return subprocess.CompletedProcess(
         args=cmd, returncode=returncode,
@@ -142,26 +191,22 @@ def extract_text(result: subprocess.CompletedProcess) -> str:
 
 
 def run_step(prompt: str) -> None:
+    global _log_fh
+
     run_dir = make_run_dir()
     t0 = time.monotonic()
 
     log_file = run_dir / "logs.txt"
-    file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(logging.Formatter(
-        "%(asctime)s  %(levelname)-7s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-    ))
-    log.addHandler(file_handler)
+    _log_fh = open(log_file, "a", encoding="utf-8")
 
-    log.info("Run dir: %s", run_dir)
-    log.info("Log file: %s", log_file)
+    dim(f"run dir  {run_dir}")
+    dim(f"log file {log_file}")
 
-    # --- Phase 1: Plan ---
-    log.info("=" * 60)
-    log.info("Planning phase")
-    log.info("=" * 60)
+    # ── Plan ──
+    header("Planning")
+
     preview = prompt[:200] + ("…" if len(prompt) > 200 else "")
-    log.info("Prompt preview: %s", preview)
+    dim(f"prompt preview: {preview}")
 
     plan_result = run_agent(
         ["agent", "-p", "--force", "--mode", "plan", "--output-format", "text", prompt],
@@ -171,25 +216,23 @@ def run_step(prompt: str) -> None:
 
     plan_text = extract_text(plan_result)
     (run_dir / "plan.md").write_text(plan_text)
-    log.info("Plan saved → %s (%d chars)", run_dir / "plan.md", len(plan_text))
+    ok(f"Plan saved → {run_dir / 'plan.md'} ({len(plan_text)} chars)")
 
     if plan_result.returncode != 0:
-        log.warning("Plan phase exited with code %d — skipping execution", plan_result.returncode)
-        log.removeHandler(file_handler)
-        file_handler.close()
+        err(f"Plan phase exited with code {plan_result.returncode} — skipping execution")
+        _log_fh.close()
+        _log_fh = None
         return
 
-    # --- Phase 2: Execute ---
-    log.info("=" * 60)
-    log.info("Execution phase")
-    log.info("=" * 60)
+    # ── Execute ──
+    header("Execution")
 
     execute_prompt = (
         f"Here is the plan that was previously generated:\n\n"
         f"---\n{plan_text}\n---\n\n"
         f"Now implement this plan. The original request was:\n\n{prompt}"
     )
-    log.info("Execution prompt size: %d chars (plan=%d + original=%d)", len(execute_prompt), len(plan_text), len(prompt))
+    dim(f"prompt size: {len(execute_prompt)} chars (plan={len(plan_text)} + original={len(prompt)})")
 
     exec_result = run_agent(
         ["agent", "-p", "--force", "--output-format", "text", execute_prompt],
@@ -199,29 +242,34 @@ def run_step(prompt: str) -> None:
 
     exec_text = extract_text(exec_result)
     (run_dir / "rollout.md").write_text(exec_text)
-    log.info("Rollout saved → %s (%d chars)", run_dir / "rollout.md", len(exec_text))
+    ok(f"Rollout saved → {run_dir / 'rollout.md'} ({len(exec_text)} chars)")
 
     elapsed = time.monotonic() - t0
     if exec_result.returncode != 0:
-        log.warning("Execution phase exited with code %d", exec_result.returncode)
+        err(f"Execution phase exited with code {exec_result.returncode}")
     else:
-        log.info("Run completed successfully")
-    log.info("Total duration: %s", fmt_duration(elapsed))
+        ok("Run completed successfully")
 
-    log.removeHandler(file_handler)
-    file_handler.close()
+    dim(f"total duration: {fmt_duration(elapsed)}")
+
+    _log_fh.close()
+    _log_fh = None
 
 
 def main() -> None:
-    log.info("Prompt file : %s", PROMPT_FILE)
-    log.info("Working dir : %s", WORKING_DIR)
-    log.info("History dir : %s", HISTORY_DIR)
+    banner()
+    header("Agent loop")
+
+    dim(f"prompt   {PROMPT_FILE}")
+    dim(f"workdir  {WORKING_DIR}")
+    dim(f"history  {HISTORY_DIR}")
 
     loop_count = 0
     while True:
         loop_count += 1
         prompt = load_prompt()
-        log.info("Loop iteration %d  prompt=%d chars", loop_count, len(prompt))
+        header(f"Iteration {loop_count}")
+        dim(f"prompt={len(prompt)} chars")
         run_step(prompt)
 
 

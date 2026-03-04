@@ -9,3 +9,6 @@ dependencies = [
     "requests",
     "python-dotenv",
 ]
+
+[tool.setuptools]
+py-modules = ["agent"]

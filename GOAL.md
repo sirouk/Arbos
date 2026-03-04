@@ -1,1 +1,0 @@
-Make money trading on Hyperliquid using data from CoinGlass and Hyperliquid.
