@@ -144,7 +144,7 @@ def make_run_dir(goal_id: str) -> Path:
 
 def log_chat(role: str, text: str):
     """Append a message to the current chatlog file. Rolls to a new file when size exceeds limit."""
-    CHATLOG_DIR.mkdir(exist_ok=True)
+    CHATLOG_DIR.mkdir(parents=True, exist_ok=True)
     max_file_size = 4000
     max_files = 50
 
