@@ -4,20 +4,44 @@ import subprocess
 import sys
 import time
 import threading
+import difflib
+import hashlib
 from pathlib import Path
 from datetime import datetime
 
 from dotenv import load_dotenv
+import requests
 
 WORKING_DIR = Path(__file__).parent
 load_dotenv(WORKING_DIR / ".env")
 
+README_FILE = WORKING_DIR / "README.md"
 PROMPT_FILE = WORKING_DIR / "PROMPT.md"
 AGENTS_META = WORKING_DIR / "agents.json"
 CONTEXT_DIR = WORKING_DIR / "context"
 CHATLOG_DIR = CONTEXT_DIR / "chat"
 RESTART_FLAG = WORKING_DIR / ".restart"
 CHAT_ID_FILE = WORKING_DIR / "chat_id.txt"
+STEP_UPDATE_CHAR_LIMIT = 500
+STEP_DIFF_CHAR_LIMIT = 5000
+STEP_SOURCE_CHAR_LIMIT = 3500
+STEP_SNAPSHOT_MAX_FILE_SIZE = 200_000
+STEP_SNAPSHOT_EXCLUDE_PREFIXES = (
+    ".git/",
+    ".venv/",
+    "__pycache__/",
+    "build/",
+    "context/",
+    "dist/",
+    "logs/",
+)
+STEP_SNAPSHOT_EXCLUDE_FILES = {
+    ".arbos-launch.sh",
+    ".arbos.pid",
+    ".env",
+    ".restart",
+    "chat_id.txt",
+}
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 
@@ -33,6 +57,7 @@ else:
 
 _log_fh = None
 _log_lock = threading.Lock()
+_agent_wake = threading.Event()
 
 
 def _file_log(msg: str):
@@ -119,6 +144,26 @@ def save_agents(data: dict):
 
 
 # ── File helpers ─────────────────────────────────────────────────────────────
+
+def start_instructions() -> str:
+    if not README_FILE.exists():
+        return "README.md not found."
+
+    lines = README_FILE.read_text().splitlines()
+    collected = []
+    include = False
+
+    for line in lines:
+        if line.startswith("## Getting started"):
+            include = True
+        if include and line.strip() == "MIT":
+            break
+        if include:
+            collected.append(line)
+
+    text = "\n".join(collected).strip()
+    return text or "README.md does not contain start instructions."
+
 
 def load_prompt(agent_id: str | None = None, consume_inbox: bool = False) -> str:
     """Build full prompt: PROMPT + GOAL + STATE + INBOX + chatlog. Optionally clears INBOX."""
@@ -237,6 +282,295 @@ def _describe_tool_call(tc: dict) -> str:
     return str(list(tc.keys()))
 
 
+def _git_paths(*args: str) -> list[str]:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=WORKING_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return []
+
+    if result.returncode != 0 or not result.stdout:
+        return []
+    return [p for p in result.stdout.split("\0") if p]
+
+
+def _should_snapshot_path(rel_path: str) -> bool:
+    if rel_path in STEP_SNAPSHOT_EXCLUDE_FILES:
+        return False
+    return not any(rel_path.startswith(prefix) for prefix in STEP_SNAPSHOT_EXCLUDE_PREFIXES)
+
+
+def _capture_repo_snapshot() -> dict[str, dict]:
+    tracked = _git_paths("ls-files", "-z")
+    untracked = _git_paths("ls-files", "--others", "--exclude-standard", "-z")
+    snapshot: dict[str, dict] = {}
+
+    for rel_path in sorted(set(tracked + untracked)):
+        if not _should_snapshot_path(rel_path):
+            continue
+
+        file_path = WORKING_DIR / rel_path
+        if not file_path.is_file():
+            continue
+
+        try:
+            data = file_path.read_bytes()
+        except OSError:
+            continue
+
+        entry = {
+            "sha1": hashlib.sha1(data).hexdigest(),
+            "size": len(data),
+            "text": None,
+        }
+        if len(data) <= STEP_SNAPSHOT_MAX_FILE_SIZE and b"\0" not in data:
+            try:
+                entry["text"] = data.decode("utf-8")
+            except UnicodeDecodeError:
+                pass
+
+        snapshot[rel_path] = entry
+
+    return snapshot
+
+
+def _clip_text(text: str, max_chars: int) -> str:
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    keep = max((max_chars - 5) // 2, 1)
+    return f"{text[:keep]}\n...\n{text[-keep:]}"
+
+
+def _build_step_code_edit_summary(before: dict[str, dict], after: dict[str, dict]) -> tuple[str, list[str]]:
+    changed_paths: list[str] = []
+    chunks: list[str] = []
+
+    for rel_path in sorted(set(before) | set(after)):
+        prev = before.get(rel_path)
+        curr = after.get(rel_path)
+        if prev and curr and prev["sha1"] == curr["sha1"]:
+            continue
+
+        changed_paths.append(rel_path)
+
+        if prev is None and curr is not None:
+            chunks.append(f"Added {rel_path}")
+            if curr.get("text"):
+                added_lines = [line for line in curr["text"].splitlines()[:12] if line.strip()]
+                if added_lines:
+                    chunks.append("\n".join(f"+ {line}" for line in added_lines[:8]))
+            continue
+
+        if curr is None and prev is not None:
+            chunks.append(f"Deleted {rel_path}")
+            continue
+
+        chunks.append(f"Modified {rel_path}")
+        prev_text = prev.get("text") if prev else None
+        curr_text = curr.get("text") if curr else None
+        if prev_text is None or curr_text is None:
+            chunks.append("(binary or large file)")
+            continue
+
+        diff_lines = list(
+            difflib.unified_diff(
+                prev_text.splitlines(),
+                curr_text.splitlines(),
+                fromfile=f"a/{rel_path}",
+                tofile=f"b/{rel_path}",
+                lineterm="",
+                n=2,
+            )
+        )
+        excerpt: list[str] = []
+        for line in diff_lines:
+            if line.startswith(("---", "+++", "@@")):
+                excerpt.append(line)
+                continue
+            if line.startswith(("+", "-")) and len(excerpt) < 18:
+                excerpt.append(line)
+        if excerpt:
+            chunks.append("\n".join(excerpt[:18]))
+
+    if not changed_paths:
+        return "No repo file edits this step.", []
+
+    text = "\n\n".join(chunks)
+    if len(text) > STEP_DIFF_CHAR_LIMIT:
+        text = text[:STEP_DIFF_CHAR_LIMIT] + "\n...(truncated)"
+    return text, changed_paths
+
+
+def _normalize_step_update(text: str, *, step_number: int, agent_id: str, success: bool) -> str:
+    cleaned = " ".join((text or "").split())
+    if not cleaned:
+        status = "success" if success else "failed"
+        cleaned = f"Step {step_number} agent {agent_id}: {status}; no summary generated."
+    if len(cleaned) > STEP_UPDATE_CHAR_LIMIT:
+        cleaned = cleaned[: STEP_UPDATE_CHAR_LIMIT - 1].rstrip() + "…"
+    return cleaned
+
+
+def _fallback_step_update(
+    *,
+    step_number: int,
+    agent_id: str,
+    success: bool,
+    changed_paths: list[str],
+    plan_text: str,
+    rollout_text: str,
+    logs_text: str,
+) -> str:
+    status = "success" if success else "failed"
+
+    def first_line(text: str) -> str:
+        for line in text.splitlines():
+            cleaned = line.strip().lstrip("-*0123456789. ")
+            if cleaned:
+                return cleaned
+        return ""
+
+    action = first_line(rollout_text) or first_line(plan_text) or first_line(logs_text) or "completed a step"
+    if changed_paths:
+        edits = ", ".join(changed_paths[:3])
+        if len(changed_paths) > 3:
+            edits += ", ..."
+        edit_text = f"edits: {edits}"
+    else:
+        edit_text = "no code edits"
+
+    return _normalize_step_update(
+        f"Step {step_number} agent {agent_id}: {status}; {action}; {edit_text}.",
+        step_number=step_number,
+        agent_id=agent_id,
+        success=success,
+    )
+
+
+def _generate_step_update(
+    *,
+    step_number: int,
+    agent_id: str,
+    success: bool,
+    run_dir: Path,
+    changed_paths: list[str],
+    code_edit_summary: str,
+) -> str:
+    plan_text = (run_dir / "plan.md").read_text() if (run_dir / "plan.md").exists() else ""
+    rollout_text = (run_dir / "rollout.md").read_text() if (run_dir / "rollout.md").exists() else ""
+    logs_text = (run_dir / "logs.txt").read_text() if (run_dir / "logs.txt").exists() else ""
+
+    changed_display = ", ".join(changed_paths[:8]) if changed_paths else "(none)"
+    prompt = (
+        "Summarize one completed Arbos agent step as a Telegram update.\n"
+        f"Return plain text only, max {STEP_UPDATE_CHAR_LIMIT} characters total.\n"
+        "Include all of the following in one compact sentence or two short sentences:\n"
+        "- step number and agent id\n"
+        "- whether the step succeeded or failed\n"
+        "- the main action taken from the plan/rollout/logs\n"
+        "- concrete code edits, or say no code edits\n"
+        "- blocker or next action if one is visible\n"
+        "Use specific file paths when useful. No markdown bullets, no code fences, no quotes.\n\n"
+        f"Step number: {step_number}\n"
+        f"Agent id: {agent_id}\n"
+        f"Outcome: {'success' if success else 'failure'}\n"
+        f"Changed files: {changed_display}\n\n"
+        f"Plan:\n{_clip_text(plan_text, STEP_SOURCE_CHAR_LIMIT)}\n\n"
+        f"Rollout:\n{_clip_text(rollout_text, STEP_SOURCE_CHAR_LIMIT)}\n\n"
+        f"Logs:\n{_clip_text(logs_text, STEP_SOURCE_CHAR_LIMIT)}\n\n"
+        f"Code edits:\n{code_edit_summary}"
+    )
+
+    result = run_agent(
+        ["agent", "-p", "--force", "--mode", "plan", "--output-format", "text", prompt],
+        phase="summary",
+        output_file=run_dir / "summary_output.txt",
+    )
+    summary_text = extract_text(result)
+    if result.returncode != 0:
+        return _fallback_step_update(
+            step_number=step_number,
+            agent_id=agent_id,
+            success=success,
+            changed_paths=changed_paths,
+            plan_text=plan_text,
+            rollout_text=rollout_text,
+            logs_text=logs_text,
+        )
+
+    return _normalize_step_update(
+        summary_text,
+        step_number=step_number,
+        agent_id=agent_id,
+        success=success,
+    )
+
+
+def _send_telegram_text(text: str) -> bool:
+    token = os.getenv("TAU_BOT_TOKEN")
+    if not token:
+        dim("step update skipped: TAU_BOT_TOKEN not set")
+        return False
+    if not CHAT_ID_FILE.exists():
+        dim("step update skipped: chat_id.txt not found")
+        return False
+
+    chat_id = CHAT_ID_FILE.read_text().strip()
+    if not chat_id:
+        dim("step update skipped: empty chat_id.txt")
+        return False
+
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": text[:4000]},
+            timeout=15,
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        err(f"step update send failed: {str(exc)[:120]}")
+        return False
+
+    log_chat("bot", text[:1000])
+    ok("step update sent to Telegram")
+    return True
+
+
+def _can_send_step_updates() -> bool:
+    if not os.getenv("TAU_BOT_TOKEN"):
+        dim("step update skipped: TAU_BOT_TOKEN not set")
+        return False
+    if not CHAT_ID_FILE.exists():
+        dim("step update skipped: chat_id.txt not found")
+        return False
+    if not CHAT_ID_FILE.read_text().strip():
+        dim("step update skipped: empty chat_id.txt")
+        return False
+    return True
+
+
+def _send_step_update(step_number: int, agent_id: str, run_dir: Path, success: bool, before_snapshot: dict[str, dict]):
+    if not _can_send_step_updates():
+        return
+    after_snapshot = _capture_repo_snapshot()
+    code_edit_summary, changed_paths = _build_step_code_edit_summary(before_snapshot, after_snapshot)
+    summary_text = _generate_step_update(
+        step_number=step_number,
+        agent_id=agent_id,
+        success=success,
+        run_dir=run_dir,
+        changed_paths=changed_paths,
+        code_edit_summary=code_edit_summary,
+    )
+    _send_telegram_text(summary_text)
+
+
 # ── Agent runner (console, used by the main loop) ───────────────────────────
 
 def run_agent(cmd: list[str], phase: str, output_file: Path) -> subprocess.CompletedProcess:
@@ -328,73 +662,78 @@ def extract_text(result: subprocess.CompletedProcess) -> str:
     return output
 
 
-def run_step(prompt: str, agent_id: str) -> bool:
+def run_step(prompt: str, agent_id: str, step_number: int) -> bool:
     global _log_fh
 
     run_dir = make_run_dir(agent_id)
     t0 = time.monotonic()
+    before_snapshot = _capture_repo_snapshot()
 
     log_file = run_dir / "logs.txt"
     with _log_lock:
         _log_fh = open(log_file, "a", encoding="utf-8")
 
-    dim(f"run dir  {run_dir}")
-    dim(f"log file {log_file}")
+    success = False
+    try:
+        dim(f"run dir  {run_dir}")
+        dim(f"log file {log_file}")
 
-    header("Planning")
+        header("Planning")
 
-    preview = prompt[:200] + ("…" if len(prompt) > 200 else "")
-    dim(f"prompt preview: {preview}")
+        preview = prompt[:200] + ("…" if len(prompt) > 200 else "")
+        dim(f"prompt preview: {preview}")
 
-    plan_result = run_agent(
-        ["agent", "-p", "--force", "--mode", "plan", "--output-format", "text", prompt],
-        phase="plan",
-        output_file=run_dir / "plan_output.txt",
-    )
+        plan_result = run_agent(
+            ["agent", "-p", "--force", "--mode", "plan", "--output-format", "text", prompt],
+            phase="plan",
+            output_file=run_dir / "plan_output.txt",
+        )
 
-    plan_text = extract_text(plan_result)
-    (run_dir / "plan.md").write_text(plan_text)
-    ok(f"Plan saved → {run_dir / 'plan.md'} ({len(plan_text)} chars)")
+        plan_text = extract_text(plan_result)
+        (run_dir / "plan.md").write_text(plan_text)
+        ok(f"Plan saved → {run_dir / 'plan.md'} ({len(plan_text)} chars)")
 
-    if plan_result.returncode != 0:
-        err(f"Plan phase exited with code {plan_result.returncode} — skipping execution")
+        if plan_result.returncode != 0:
+            err(f"Plan phase exited with code {plan_result.returncode} — skipping execution")
+            return False
+
+        header("Execution")
+
+        execute_prompt = (
+            f"Here is the plan that was previously generated:\n\n"
+            f"---\n{plan_text}\n---\n\n"
+            f"Now implement this plan. The original request was:\n\n{prompt}"
+        )
+        dim(f"prompt size: {len(execute_prompt)} chars (plan={len(plan_text)} + original={len(prompt)})")
+
+        exec_result = run_agent(
+            ["agent", "-p", "--force", "--output-format", "text", execute_prompt],
+            phase="exec",
+            output_file=run_dir / "exec_output.txt",
+        )
+
+        exec_text = extract_text(exec_result)
+        (run_dir / "rollout.md").write_text(exec_text)
+        ok(f"Rollout saved → {run_dir / 'rollout.md'} ({len(exec_text)} chars)")
+
+        elapsed = time.monotonic() - t0
+        success = exec_result.returncode == 0
+        if not success:
+            err(f"Execution phase exited with code {exec_result.returncode}")
+        else:
+            ok("Run completed successfully")
+
+        dim(f"total duration: {fmt_duration(elapsed)}")
+        return success
+    finally:
         with _log_lock:
-            _log_fh.close()
-            _log_fh = None
-        return False
-
-    header("Execution")
-
-    execute_prompt = (
-        f"Here is the plan that was previously generated:\n\n"
-        f"---\n{plan_text}\n---\n\n"
-        f"Now implement this plan. The original request was:\n\n{prompt}"
-    )
-    dim(f"prompt size: {len(execute_prompt)} chars (plan={len(plan_text)} + original={len(prompt)})")
-
-    exec_result = run_agent(
-        ["agent", "-p", "--force", "--output-format", "text", execute_prompt],
-        phase="exec",
-        output_file=run_dir / "exec_output.txt",
-    )
-
-    exec_text = extract_text(exec_result)
-    (run_dir / "rollout.md").write_text(exec_text)
-    ok(f"Rollout saved → {run_dir / 'rollout.md'} ({len(exec_text)} chars)")
-
-    elapsed = time.monotonic() - t0
-    success = exec_result.returncode == 0
-    if not success:
-        err(f"Execution phase exited with code {exec_result.returncode}")
-    else:
-        ok("Run completed successfully")
-
-    dim(f"total duration: {fmt_duration(elapsed)}")
-
-    with _log_lock:
-        _log_fh.close()
-        _log_fh = None
-    return success
+            if _log_fh:
+                _log_fh.close()
+                _log_fh = None
+        try:
+            _send_step_update(step_number, agent_id, run_dir, success, before_snapshot)
+        except Exception as exc:
+            err(f"step update generation failed: {str(exc)[:120]}")
 
 
 # ── Agent loop (always-on, runs as daemon thread) ───────────────────────────
@@ -405,7 +744,8 @@ def agent_loop():
     while True:
         agents = load_agents()
         if not agents:
-            time.sleep(5)
+            _agent_wake.wait(timeout=5)
+            _agent_wake.clear()
             continue
 
         now = time.time()
@@ -426,7 +766,8 @@ def agent_loop():
                 min_wait = min(min_wait, remaining)
 
         if best_id is None:
-            time.sleep(min(min_wait, 10))
+            _agent_wake.wait(timeout=min(min_wait, 10))
+            _agent_wake.clear()
             continue
 
         step_count += 1
@@ -439,7 +780,7 @@ def agent_loop():
 
         dim(f"prompt={len(prompt)} chars")
 
-        success = run_step(prompt, best_id)
+        success = run_step(prompt, best_id, step_count)
 
         agents = load_agents()
         if best_id in agents:
@@ -732,9 +1073,18 @@ def run_bot():
             return
 
         description = parts[2] if len(parts) > 2 else ""
+        is_new = aid not in agents
         agents[aid] = {"delay": delay, "last_run": agents.get(aid, {}).get("last_run", 0), "failures": 0}
         save_agents(agents)
         goal_file(aid).write_text(description + "\n")
+        if is_new:
+            sf = state_file(aid)
+            if not sf.exists():
+                sf.write_text("# State\n\nAgent just created. No steps run yet.\n")
+            ibf = inbox_file(aid)
+            if not ibf.exists():
+                ibf.write_text("")
+        _agent_wake.set()
         bot.reply_to(message, f"✅ Agent `{aid}` set  delay={delay}s  ({len(description)} chars)")
         log_chat("bot", f"Agent set: {aid} delay={delay}s {description[:200]}")
 
@@ -780,6 +1130,7 @@ def run_bot():
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
         with open(ibf, "a", encoding="utf-8") as f:
             f.write(f"[{ts}] {content}\n")
+        _agent_wake.set()
         bot.reply_to(message, f"✅ Message queued for {aid} ({len(content)} chars)")
         log_chat("bot", f"Message to {aid}: {content[:200]}")
 
@@ -857,6 +1208,13 @@ def run_bot():
             RESTART_FLAG.touch()
 
         threading.Thread(target=_run, daemon=True).start()
+
+    # ── /start — show README instructions ────────────────────────────────
+
+    @bot.message_handler(commands=["start"])
+    def handle_start(message):
+        _save_chat_id(message.chat.id)
+        bot.reply_to(message, start_instructions())
 
     # ── /status — show current state ─────────────────────────────────────
 
