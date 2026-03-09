@@ -210,7 +210,7 @@ def _generate_step_update(*, step_number: int, success: bool, run_dir: Path) -> 
         f"Logs:\n{_clip_text(logs_text, STEP_SOURCE_CHAR_LIMIT)}"
     )
 
-    summary_cmd = ["codex", "exec", "--sandbox", "read-only", "--json"]
+    summary_cmd = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "--json"]
     if STEP_SUMMARY_MODEL:
         summary_cmd.extend(["--model", STEP_SUMMARY_MODEL])
     summary_cmd.append(prompt)
@@ -352,7 +352,7 @@ def run_step(prompt: str, step_number: int) -> bool:
         _send_telegram_text(f"Step {step_number}: starting plan phase")
 
         plan_result = run_agent(
-            ["codex", "exec", "--sandbox", "read-only", "--json", prompt],
+            ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "--json", prompt],
             phase="plan",
             output_file=run_dir / "plan_output.txt",
         )
@@ -374,7 +374,7 @@ def run_step(prompt: str, step_number: int) -> bool:
         _send_telegram_text(f"Step {step_number}: starting exec phase")
 
         exec_result = run_agent(
-            ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "--json", execute_prompt],
+            ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "--json", execute_prompt],
             phase="exec",
             output_file=run_dir / "exec_output.txt",
         )
@@ -494,13 +494,9 @@ def _build_operator_prompt(user_text: str) -> str:
     return "\n\n".join(parts)
 
 
-def run_agent_streaming(bot, prompt: str, chat_id: int, *, execute: bool = False) -> str:
+def run_agent_streaming(bot, prompt: str, chat_id: int) -> str:
     """Run the Codex CLI and stream output into a Telegram message."""
-    cmd = ["codex", "exec", "--json"]
-    if execute:
-        cmd.append("--dangerously-bypass-approvals-and-sandbox")
-    else:
-        cmd.extend(["--sandbox", "read-only"])
+    cmd = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "--json"]
 
     cmd.append(prompt)
 
@@ -597,7 +593,7 @@ def run_bot():
         prompt = _build_operator_prompt(message.text)
 
         def _run():
-            response = run_agent_streaming(bot, prompt, message.chat.id, execute=True)
+            response = run_agent_streaming(bot, prompt, message.chat.id)
             log_chat("bot", response[:1000])
             _agent_wake.set()
             load_dotenv(WORKING_DIR / ".env", override=True)
