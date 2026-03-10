@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import selectors
@@ -282,7 +283,7 @@ def _send_step_update(step_number: int, run_dir: Path, success: bool):
 
 # ── Agent runner ─────────────────────────────────────────────────────────────
 
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "anthropic/claude-opus-4.5")
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "anthropic/claude-opus-4.6")
 
 
 def _write_claude_settings():
@@ -553,6 +554,45 @@ def agent_loop():
         _agent_wake.clear()
 
 
+TRANSCRIPTION_MODEL = os.environ.get("TRANSCRIPTION_MODEL", "google/gemini-2.5-flash")
+
+
+def transcribe_voice(file_path: str, fmt: str = "ogg") -> str:
+    """Transcribe an audio file via OpenRouter's audio-capable models."""
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not api_key:
+        return "(transcription failed: no API key)"
+
+    with open(file_path, "rb") as f:
+        b64_audio = base64.b64encode(f.read()).decode("utf-8")
+
+    payload = {
+        "model": TRANSCRIPTION_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Transcribe this audio exactly. Return only the transcription, nothing else."},
+                    {"type": "input_audio", "input_audio": {"data": b64_audio, "format": fmt}},
+                ],
+            }
+        ],
+    }
+
+    try:
+        resp = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+    except Exception as exc:
+        _log(f"transcription failed: {str(exc)[:200]}")
+        return f"(transcription failed: {str(exc)[:100]})"
+
+
 # ── Telegram bot ─────────────────────────────────────────────────────────────
 
 def _recent_context(max_chars: int = 6000) -> str:
@@ -703,6 +743,39 @@ def run_bot():
             message.chat.id,
             "Give me a goal and I'll work on it. You can also send me messages to update the goal, state, or inbox.",
         )
+
+    @bot.message_handler(content_types=["voice", "audio"])
+    def handle_voice(message):
+        _save_chat_id(message.chat.id)
+        bot.send_message(message.chat.id, "Transcribing voice note...")
+
+        file_info = bot.get_file(message.voice.file_id if message.voice else message.audio.file_id)
+        downloaded = bot.download_file(file_info.file_path)
+
+        ext = file_info.file_path.rsplit(".", 1)[-1] if "." in file_info.file_path else "ogg"
+        tmp_path = WORKING_DIR / f"_voice_tmp.{ext}"
+        tmp_path.write_bytes(downloaded)
+
+        try:
+            transcript = transcribe_voice(str(tmp_path), fmt=ext)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+        caption = message.caption or ""
+        user_text = f"[Voice note transcription]: {transcript}"
+        if caption:
+            user_text += f"\n[Caption]: {caption}"
+
+        log_chat("user", user_text[:1000])
+        prompt = _build_operator_prompt(user_text)
+
+        def _run():
+            response = run_agent_streaming(bot, prompt, message.chat.id)
+            log_chat("bot", response[:1000])
+            _agent_wake.set()
+            load_dotenv(WORKING_DIR / ".env", override=True)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     @bot.message_handler(func=lambda m: True)
     def handle_message(message):
