@@ -146,7 +146,7 @@ printf "\n"
 
 printf "  ${BOLD}Installing tooling${NC}\n\n"
 
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.npm-global/bin:/usr/local/bin:$PATH"
 
 # uv
 if command_exists uv; then
@@ -157,18 +157,16 @@ else
     command_exists uv || die "uv install failed"
 fi
 
-# OpenAI Codex CLI
-if command_exists codex; then
-    ok "Codex CLI already installed"
+# Claude Code CLI
+if command_exists claude; then
+    ok "Claude Code already installed"
 else
     if command_exists npm; then
-        run "Installing Codex CLI" npm install -g @openai/codex
-    elif command_exists brew; then
-        run "Installing Codex CLI" brew install --cask codex
+        run "Installing Claude Code" npm install -g @anthropic-ai/claude-code
     else
-        die "npm or brew required to install Codex CLI"
+        die "npm required to install Claude Code CLI"
     fi
-    command_exists codex || die "'codex' command not found — install via: npm i -g @openai/codex"
+    command_exists claude || die "'claude' command not found — install via: npm i -g @anthropic-ai/claude-code"
 fi
 
 # PATH persistence
@@ -247,9 +245,9 @@ ask_key() {
     ok "$key_name saved"
 }
 
-ask_key "OPENAI_API_KEY" \
-    "OpenAI API key" \
-    "Get yours at: https://platform.openai.com/api-keys" \
+ask_key "OPENROUTER_API_KEY" \
+    "OpenRouter API key" \
+    "Get yours at: https://openrouter.ai/keys" \
     "required"
 
 printf "\n"
@@ -265,15 +263,15 @@ printf "\n"
 
 printf "  ${BOLD}Starting Arbos${NC}\n\n"
 
-if ! command_exists codex; then
-    die "'codex' command not found in PATH — install via: npm i -g @openai/codex"
+if ! command_exists claude; then
+    die "'claude' command not found in PATH — install via: npm i -g @anthropic-ai/claude-code"
 fi
-ok "codex CLI found at $(which codex)"
+ok "Claude Code found at $(which claude)"
 
 LAUNCH_SCRIPT="$INSTALL_DIR/.arbos-launch.sh"
 cat > "$LAUNCH_SCRIPT" <<LAUNCH
 #!/usr/bin/env bash
-export PATH="\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH"
+export PATH="\$HOME/.local/bin:\$HOME/.cargo/bin:\$HOME/.npm-global/bin:/usr/local/bin:\$PATH"
 cd "$INSTALL_DIR"
 set -a; [ -f .env ] && source .env; set +a
 source .venv/bin/activate
