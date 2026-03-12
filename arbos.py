@@ -241,7 +241,6 @@ _chatlog_lock = threading.Lock()
 _pending_env_lock = threading.Lock()
 _agent_wake = threading.Event()
 _shutdown = threading.Event()
-_bot_busy = threading.Lock()
 _claude_semaphore = threading.Semaphore(MAX_CONCURRENT)
 _step_count = 0
 _goal_hash: str = ""
@@ -1295,8 +1294,6 @@ def agent_loop():
             _agent_wake.wait(timeout=5)
             continue
 
-        _bot_busy.acquire()
-        _bot_busy.release()
 
         import hashlib
         current_goal = GOAL_FILE.read_text().strip()
@@ -1686,6 +1683,43 @@ def run_bot():
         bot.send_message(message.chat.id, f"Cleared: {summary}\nReady for a fresh /goal.")
         _log(f"cleared via /clear command: {summary}")
 
+    @bot.message_handler(commands=["restart"])
+    def handle_restart(message):
+        uid = message.from_user.id if message.from_user else None
+        if not _is_owner(uid):
+            _reject(message)
+            return
+        bot.send_message(message.chat.id, "Restarting — killing agent and exiting for pm2...")
+        _log("restart requested via /restart command")
+        _kill_child_procs()
+        RESTART_FLAG.touch()
+
+    @bot.message_handler(commands=["update"])
+    def handle_update(message):
+        uid = message.from_user.id if message.from_user else None
+        if not _is_owner(uid):
+            _reject(message)
+            return
+        msg = bot.send_message(message.chat.id, "Pulling latest changes...")
+        try:
+            r = subprocess.run(
+                ["git", "pull", "--ff-only"],
+                cwd=WORKING_DIR, capture_output=True, text=True, timeout=30,
+            )
+            output = (r.stdout.strip() + "\n" + r.stderr.strip()).strip()
+            if r.returncode != 0:
+                bot.edit_message_text(f"Git pull failed:\n{output[:3800]}", message.chat.id, msg.message_id)
+                _log(f"update failed: {output[:200]}")
+                return
+            bot.edit_message_text(f"Pulled:\n{output[:3800]}\n\nRestarting...", message.chat.id, msg.message_id)
+            _log(f"update pulled: {output[:200]}")
+        except Exception as exc:
+            bot.edit_message_text(f"Git pull error: {str(exc)[:3800]}", message.chat.id, msg.message_id)
+            _log(f"update error: {str(exc)[:200]}")
+            return
+        _kill_child_procs()
+        RESTART_FLAG.touch()
+
     @bot.message_handler(content_types=["voice", "audio"])
     def handle_voice(message):
         uid = message.from_user.id if message.from_user else None
@@ -1717,10 +1751,9 @@ def run_bot():
         prompt = _build_operator_prompt(user_text)
 
         def _run():
-            with _bot_busy:
-                response = run_agent_streaming(bot, prompt, message.chat.id)
-                log_chat("bot", response[:1000])
-                _process_pending_env()
+            response = run_agent_streaming(bot, prompt, message.chat.id)
+            log_chat("bot", response[:1000])
+            _process_pending_env()
             _agent_wake.set()
 
         threading.Thread(target=_run, daemon=True).start()
@@ -1736,10 +1769,9 @@ def run_bot():
         prompt = _build_operator_prompt(message.text)
 
         def _run():
-            with _bot_busy:
-                response = run_agent_streaming(bot, prompt, message.chat.id)
-                log_chat("bot", response[:1000])
-                _process_pending_env()
+            response = run_agent_streaming(bot, prompt, message.chat.id)
+            log_chat("bot", response[:1000])
+            _process_pending_env()
             _agent_wake.set()
 
         threading.Thread(target=_run, daemon=True).start()
