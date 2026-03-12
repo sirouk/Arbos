@@ -217,8 +217,6 @@ def _redact_secrets(text: str) -> str:
         text = pattern.sub("[REDACTED]", text)
     return text
 STEP_UPDATE_CHAR_LIMIT = 500
-STEP_SOURCE_CHAR_LIMIT = 3500
-STEP_SUMMARY_MODEL = ""
 MAX_CONCURRENT = int(os.environ.get("CLAUDE_MAX_CONCURRENT", "4"))
 
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "moonshotai/Kimi-K2.5-TEE")
@@ -361,29 +359,10 @@ def load_chatlog(max_chars: int = 8000) -> str:
 
 # ── Step update helpers ──────────────────────────────────────────────────────
 
-def _clip_text(text: str, max_chars: int) -> str:
-    text = text.strip()
-    if len(text) <= max_chars:
-        return text
-    keep = max((max_chars - 5) // 2, 1)
-    return f"{text[:keep]}\n...\n{text[-keep:]}"
-
-
-def _normalize_step_update(text: str, *, step_number: int, success: bool) -> str:
-    cleaned = " ".join((text or "").split())
-    if not cleaned:
-        status = "success" if success else "failed"
-        cleaned = f"Step {step_number}: {status}; no summary generated."
-    if len(cleaned) > STEP_UPDATE_CHAR_LIMIT:
-        cleaned = cleaned[: STEP_UPDATE_CHAR_LIMIT - 1].rstrip() + "…"
-    return cleaned
-
-
-def _fallback_step_update(
+def _build_step_update(
     *,
     step_number: int,
     success: bool,
-    plan_text: str,
     rollout_text: str,
     logs_text: str,
 ) -> str:
@@ -396,54 +375,12 @@ def _fallback_step_update(
                 return cleaned
         return ""
 
-    action = first_line(rollout_text) or first_line(plan_text) or first_line(logs_text) or "completed a step"
-    return _normalize_step_update(
-        f"Step {step_number}: {status}; {action}.",
-        step_number=step_number,
-        success=success,
-    )
-
-
-def _generate_step_update(*, step_number: int, success: bool, run_dir: Path) -> str:
-    plan_text = (run_dir / "plan.md").read_text() if (run_dir / "plan.md").exists() else ""
-    rollout_text = (run_dir / "rollout.md").read_text() if (run_dir / "rollout.md").exists() else ""
-    logs_text = (run_dir / "logs.txt").read_text() if (run_dir / "logs.txt").exists() else ""
-
-    prompt = (
-        "Summarize one completed agent step as a Telegram update.\n"
-        f"Return plain text only, max {STEP_UPDATE_CHAR_LIMIT} characters total.\n"
-        "Include:\n"
-        "- step number\n"
-        "- whether it succeeded or failed\n"
-        "- the main action taken\n"
-        "- blocker or next action if visible\n"
-        "No markdown, no code fences.\n\n"
-        f"Step number: {step_number}\n"
-        f"Outcome: {'success' if success else 'failure'}\n"
-        f"Plan:\n{_clip_text(plan_text, STEP_SOURCE_CHAR_LIMIT) or '(empty)'}\n\n"
-        f"Rollout:\n{_clip_text(rollout_text, STEP_SOURCE_CHAR_LIMIT)}\n\n"
-        f"Logs:\n{_clip_text(logs_text, STEP_SOURCE_CHAR_LIMIT)}"
-    )
-
-    extra = ["--model", STEP_SUMMARY_MODEL] if STEP_SUMMARY_MODEL else None
-    summary_cmd = _claude_cmd(prompt, extra_flags=extra)
-
-    result = run_agent(
-        summary_cmd,
-        phase="summary",
-        output_file=run_dir / "summary_output.txt",
-    )
-    summary_text = extract_text(result)
-    if result.returncode != 0:
-        return _fallback_step_update(
-            step_number=step_number,
-            success=success,
-            plan_text=plan_text,
-            rollout_text=rollout_text,
-            logs_text=logs_text,
-        )
-
-    return _normalize_step_update(summary_text, step_number=step_number, success=success)
+    action = first_line(rollout_text) or first_line(logs_text) or "completed a step"
+    summary = f"Step {step_number}: {status}; {action}."
+    cleaned = " ".join(summary.split())
+    if len(cleaned) > STEP_UPDATE_CHAR_LIMIT:
+        cleaned = cleaned[: STEP_UPDATE_CHAR_LIMIT - 1].rstrip() + "…"
+    return cleaned
 
 
 def _step_update_target() -> tuple[str, str] | None:
@@ -482,14 +419,43 @@ def _send_telegram_text(text: str, *, target: tuple[str, str] | None = None) -> 
     return True
 
 
-def _send_step_update(step_number: int, run_dir: Path, success: bool):
-    target = _step_update_target()
+def _send_telegram_message(text: str, *, target: tuple[str, str] | None = None) -> int | None:
+    """Send a Telegram message and return the message_id, or None on failure."""
+    target = target or _step_update_target()
     if not target:
-        return
-    summary_text = _generate_step_update(
-        step_number=step_number, success=success, run_dir=run_dir,
-    )
-    _send_telegram_text(summary_text, target=target)
+        return None
+    token, chat_id = target
+    text = _redact_secrets(text)
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": text[:4000]},
+            timeout=15,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data.get("result", {}).get("message_id")
+    except Exception as exc:
+        _log(f"telegram send failed: {str(exc)[:120]}")
+        return None
+
+
+def _edit_telegram_message(message_id: int, text: str, *, target: tuple[str, str] | None = None) -> bool:
+    """Edit an existing Telegram message by message_id."""
+    target = target or _step_update_target()
+    if not target:
+        return False
+    token, chat_id = target
+    text = _redact_secrets(text)
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{token}/editMessageText",
+            json={"chat_id": chat_id, "message_id": message_id, "text": text[:4000]},
+            timeout=15,
+        )
+        return True
+    except Exception:
+        return False
 
 
 # ── Chutes proxy (Anthropic Messages API → OpenAI Chat Completions) ──────────
@@ -1069,7 +1035,8 @@ def _run_claude_once(cmd, env, on_text=None, on_activity=None):
     return returncode, result_text, raw_lines, stderr_output
 
 
-def run_agent(cmd: list[str], phase: str, output_file: Path) -> subprocess.CompletedProcess:
+def run_agent(cmd: list[str], phase: str, output_file: Path,
+              on_text=None, on_activity=None) -> subprocess.CompletedProcess:
     _claude_semaphore.acquire()
     try:
         env = _claude_env()
@@ -1081,7 +1048,9 @@ def run_agent(cmd: list[str], phase: str, output_file: Path) -> subprocess.Compl
             _log(f"{phase}: starting (attempt={attempt}) flags=[{flags}]")
             t0 = time.monotonic()
 
-            returncode, result_text, raw_lines, stderr_output = _run_claude_once(cmd, env)
+            returncode, result_text, raw_lines, stderr_output = _run_claude_once(
+                cmd, env, on_text=on_text, on_activity=on_activity,
+            )
             elapsed = time.monotonic() - t0
 
             output_file.write_text("".join(raw_lines))
@@ -1127,6 +1096,32 @@ def run_step(prompt: str, step_number: int) -> bool:
     with _log_lock:
         _log_fh = open(log_file, "a", encoding="utf-8")
 
+    target = _step_update_target()
+    progress_msg_id: int | None = None
+    last_progress_edit = 0.0
+    current_activity = ""
+
+    if target:
+        progress_msg_id = _send_telegram_message(
+            f"Step {step_number}: starting...", target=target,
+        )
+
+    def _update_progress(activity: str, *, force: bool = False):
+        nonlocal last_progress_edit, current_activity
+        if not progress_msg_id:
+            return
+        current_activity = activity
+        now = time.time()
+        if not force and now - last_progress_edit < 3.0:
+            return
+        elapsed = fmt_duration(time.monotonic() - t0)
+        display = f"Step {step_number} ({elapsed})\n{activity}"
+        _edit_telegram_message(progress_msg_id, display, target=target)
+        last_progress_edit = now
+
+    def _on_activity(status: str):
+        _update_progress(status)
+
     success = False
     try:
         _log(f"run dir {run_dir}")
@@ -1134,42 +1129,21 @@ def run_step(prompt: str, step_number: int) -> bool:
         preview = prompt[:200] + ("…" if len(prompt) > 200 else "")
         _log(f"prompt preview: {preview}")
 
-        _log(f"step {step_number}: plan phase")
+        _log(f"step {step_number}: executing")
 
-        plan_result = run_agent(
+        result = run_agent(
             _claude_cmd(prompt),
-            phase="plan",
-            output_file=run_dir / "plan_output.txt",
+            phase="step",
+            output_file=run_dir / "output.txt",
+            on_activity=_on_activity,
         )
 
-        plan_text = extract_text(plan_result)
-        (run_dir / "plan.md").write_text(plan_text)
-        _log(f"plan saved ({len(plan_text)} chars)")
-
-        if plan_result.returncode != 0:
-            _log(f"plan phase exited with code {plan_result.returncode}; skipping execution")
-            return False
-
-        execute_prompt = (
-            f"Here is the plan that was previously generated:\n\n"
-            f"---\n{plan_text}\n---\n\n"
-            f"Now implement this plan. The original request was:\n\n{prompt}"
-        )
-
-        _log(f"step {step_number}: exec phase")
-
-        exec_result = run_agent(
-            _claude_cmd(execute_prompt),
-            phase="exec",
-            output_file=run_dir / "exec_output.txt",
-        )
-
-        exec_text = extract_text(exec_result)
-        (run_dir / "rollout.md").write_text(exec_text)
-        _log(f"rollout saved ({len(exec_text)} chars)")
+        rollout_text = extract_text(result)
+        (run_dir / "rollout.md").write_text(rollout_text)
+        _log(f"rollout saved ({len(rollout_text)} chars)")
 
         elapsed = time.monotonic() - t0
-        success = exec_result.returncode == 0
+        success = result.returncode == 0
         _log(f"step {'succeeded' if success else 'failed'} in {fmt_duration(elapsed)}")
         return success
     finally:
@@ -1178,7 +1152,18 @@ def run_step(prompt: str, step_number: int) -> bool:
                 _log_fh.close()
                 _log_fh = None
         try:
-            _send_step_update(step_number, run_dir, success)
+            rollout_text = (run_dir / "rollout.md").read_text() if (run_dir / "rollout.md").exists() else ""
+            logs_text = (run_dir / "logs.txt").read_text() if (run_dir / "logs.txt").exists() else ""
+            summary_text = _build_step_update(
+                step_number=step_number, success=success,
+                rollout_text=rollout_text, logs_text=logs_text,
+            )
+            if progress_msg_id and target:
+                _edit_telegram_message(progress_msg_id, summary_text, target=target)
+                log_chat("bot", summary_text[:1000])
+                _log("step update sent to Telegram (edited progress message)")
+            else:
+                _send_telegram_text(summary_text, target=target)
         except Exception as exc:
             _log(f"step update failed: {str(exc)[:120]}")
 
@@ -1199,6 +1184,7 @@ def agent_loop():
 
         prompt = load_prompt(consume_inbox=True)
         if not prompt:
+            _agent_wake.wait(timeout=5)
             continue
 
         _log(f"prompt={len(prompt)} chars")
@@ -1258,7 +1244,7 @@ def _recent_context(max_chars: int = 6000) -> str:
     parts: list[str] = []
     total = 0
     for run_dir in run_dirs:
-        for name in ("plan.md", "rollout.md"):
+        for name in ("rollout.md",):
             f = run_dir / name
             if f.exists():
                 content = f.read_text()[:2000]
@@ -1296,7 +1282,7 @@ def _build_operator_prompt(user_text: str) -> str:
         "- **Message the agent**: append a timestamped line to `context/INBOX.md`.\n"
         "- **Set system prompt**: write to `PROMPT.md`.\n"
         "- **Set env variable**: write `KEY='VALUE'` lines (one per line) to `context/.env.pending`. They are picked up automatically and persisted.\n"
-        "- **View logs**: read files in `context/runs/<timestamp>/` (plan.md, rollout.md, logs.txt).\n"
+        "- **View logs**: read files in `context/runs/<timestamp>/` (rollout.md, logs.txt).\n"
         "- **Modify code & restart**: edit code files, then run `touch .restart`.\n"
         "- **Send follow-up**: run `python arbos.py send \"message\"`.",
         f"## Current goal\n{goal}",
@@ -1327,6 +1313,25 @@ _TOOL_LABELS = {
 
 def _format_tool_activity(tool_name: str, tool_input: dict) -> str:
     label = _TOOL_LABELS.get(tool_name, tool_name)
+    detail = ""
+    if tool_name == "Bash":
+        detail = (tool_input.get("command") or "")[:80]
+    elif tool_name in ("Read", "Write", "Edit"):
+        detail = (tool_input.get("file_path") or tool_input.get("path") or "")
+        if detail:
+            detail = detail.rsplit("/", 1)[-1]
+    elif tool_name == "Glob":
+        detail = (tool_input.get("pattern") or tool_input.get("glob") or "")[:60]
+    elif tool_name == "Grep":
+        detail = (tool_input.get("pattern") or tool_input.get("regex") or "")[:60]
+    elif tool_name == "WebFetch":
+        detail = (tool_input.get("url") or "")[:60]
+    elif tool_name == "WebSearch":
+        detail = (tool_input.get("query") or tool_input.get("search_term") or "")[:60]
+    elif tool_name == "Task":
+        detail = (tool_input.get("description") or "")[:60]
+    if detail:
+        return f"{label}: {detail}"
     return f"{label}..."
 
 
